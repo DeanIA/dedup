@@ -580,8 +580,16 @@ def find_duplicates_at_threshold(distance_matrix, id_rows, faiss_ids, threshold)
         # Find positions of duplicates
         dup_positions = []
         for idx_offset, dist in enumerate(dists):
-            if dist < threshold and neigh_rows[idx_offset] >= 0:
-                dup_positions.append(idx_offset)
+            # FIXED: Use <= instead of < to include threshold value
+            # Also exclude self-matches for non-zero thresholds
+            if threshold == 0.0:
+                # For threshold 0.0, only exact matches (but not self-matches)
+                if dist == 0.0 and neigh_rows[idx_offset] >= 0:
+                    dup_positions.append(idx_offset)
+            else:
+                # For other thresholds, include distances <= threshold but exclude self-matches
+                if dist <= threshold and dist > 0.0 and neigh_rows[idx_offset] >= 0:
+                    dup_positions.append(idx_offset)
         
         # Add duplicate pairs (avoid double-counting)
         for pos in dup_positions:
@@ -654,15 +662,16 @@ def analyze_multiple_thresholds(distance_matrix, id_rows, faiss_ids, thresholds)
     
     # Process each threshold
     for threshold in thresholds:
-        print(f"Processing threshold: {threshold:.2f}")
+        print(f"Processing threshold: {threshold:.4f}")  # Changed from .3f to .4f
         
         # Find duplicates for this threshold
         duplicates_ids = find_duplicates_at_threshold(distance_matrix, id_rows, faiss_ids, threshold)
         duplicate_mapping, duplicate_ids = create_duplicate_mapping(duplicates_ids)
         file_stats = analyze_files_for_threshold(all_clip_ids, duplicate_mapping, duplicate_ids)
         
-        # Count non-duplicates for this threshold
-        non_duplicate_count = len([f for f, s in file_stats.items() if not s['is_duplicate']])
+        # Count files that have no duplicates
+        files_with_no_duplicates = [f for f, s in file_stats.items() if not s['is_duplicate']]
+        non_duplicate_file_count = len(files_with_no_duplicates)
         
         # Update results for each file
         for filename, stats in file_stats.items():
@@ -670,11 +679,11 @@ def analyze_multiple_thresholds(distance_matrix, id_rows, faiss_ids, thresholds)
                 file_results[filename]['File_name'] = filename
                 file_results[filename]['Video_length'] = stats['video_length_clips']
             
-            # FIXED: Use consistent .2f formatting throughout
             duplicate_names_str = ','.join(sorted(stats['duplicate_names'])) if stats['duplicate_names'] else 'None'
-            file_results[filename][f'Threshold_{threshold:.2f}'] = threshold
-            file_results[filename][f'Duplicate_names_{threshold:.2f}'] = duplicate_names_str
-            file_results[filename][f'Non_duplicates_{threshold:.2f}'] = non_duplicate_count
+            file_results[filename][f'Threshold_{threshold:.4f}'] = threshold  # Changed to .4f
+            file_results[filename][f'Duplicate_names_{threshold:.4f}'] = duplicate_names_str  # Changed to .4f
+            file_results[filename][f'Is_duplicate_{threshold:.4f}'] = stats['is_duplicate']  # Changed to .4f
+            file_results[filename][f'Total_non_duplicates_{threshold:.4f}'] = non_duplicate_file_count  # Changed to .4f
     
     # Convert to DataFrame
     results_list = list(file_results.values())
@@ -686,9 +695,10 @@ def analyze_multiple_thresholds(distance_matrix, id_rows, faiss_ids, thresholds)
     
     for threshold in sorted(thresholds):
         threshold_cols.extend([
-            f'Threshold_{threshold:.2f}',
-            f'Duplicate_names_{threshold:.2f}', 
-            f'Non_duplicates_{threshold:.2f}'
+            f'Threshold_{threshold:.4f}',  # Changed to .4f
+            f'Duplicate_names_{threshold:.4f}',  # Changed to .4f
+            f'Is_duplicate_{threshold:.4f}',  # Changed to .4f
+            f'Total_non_duplicates_{threshold:.4f}'  # Changed to .4f
         ])
     
     # Reorder DataFrame columns
