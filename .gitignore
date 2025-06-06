@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.venv
+venv/
+env/
+
+# Project-specific data files
+input_videos/
+
+# Generated embeddings and indexes
+embeddings.npy
+embedding_ids.npy
+clip_index.faiss
+*.npy
+*.faiss
+
+# Model cache (Hugging Face transformers)
+.cache/
+transformers_cache/
+
+# PyTorch
+*.pth
+*.pt
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# Large files that shouldn't be tracked
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.bin
+*.safetensors
