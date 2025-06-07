@@ -11,29 +11,22 @@ import pandas as pd
 from collections import defaultdict
 
 __all__ = [
-    # Directory and file utilities
     'scan_dir',
     'create_memap',
-
-    # Video processing functions
     'process_video_directory',
     '_count_segments',
-    '_sample_clips_generator',
-    '_flush_batch',
     '_extract_frame_at_current_position',
     '_create_zero_frame_fallback',
     '_ensure_minimum_frames',
     '_calculate_video_segments',
     '_calculate_clip_timestamps',
     '_seek_to_timestamp',
+    '_sample_clips_generator',
     '_convert_clips_to_pil',
     '_add_embeddings_to_faiss',
     '_store_embeddings',
-    '_load_embeddings_and_index',
-    '_create_id_to_row_mapping',
-    '_convert_index_matrix_to_row_indices',
-    '_find_duplicate_pairs',
-    'build_clip_id_lookup',
+    '_flush_batch',
+    'clip_id_lookup',
     'find_duplicates'
 ]
 
@@ -406,7 +399,7 @@ def process_video_directory(video_dir, processor, model, index, emb_memmap, id_m
     
     return total_clips, write_ptr
 
-def build_clip_id_lookup():
+def clip_id_lookup(VIDEO_DIR):
     """
     Build a dictionary mapping clip_id to (filename, clip_idx) for all videos in VIDEO_DIR.
     Returns:
@@ -432,7 +425,7 @@ def build_clip_id_lookup():
     return lookup
 
 
-def find_duplicates(lim, distance_matrix, identity_matrix):
+def find_duplicates(lim, distance_matrix, identity_matrix, id_array):
 # Find duplicate pairs 
     pairs = []
     for query in range(len(id_array)):
