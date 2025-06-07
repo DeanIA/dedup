@@ -14,23 +14,9 @@ __all__ = [
     # Directory and file utilities
     'scan_dir',
     'create_memap',
-    
+
     # Video processing functions
     'process_video_directory',
-    
-    # Duplicate detection functions
-    'find_video_duplicates',
-    'reconstruct_filename',
-    'prepare_search_matrices',
-    
-    # Multi-threshold analysis functions 
-    'find_duplicates_at_threshold',
-    'create_duplicate_mapping',
-    'analyze_files_for_threshold',        
-    'analyze_multiple_thresholds',    
-    'create_multi_threshold_analysis',      
-    
-    # Private functions
     '_count_segments',
     '_sample_clips_generator',
     '_flush_batch',
@@ -46,9 +32,10 @@ __all__ = [
     '_load_embeddings_and_index',
     '_create_id_to_row_mapping',
     '_convert_index_matrix_to_row_indices',
-    '_find_duplicate_pairs'
+    '_find_duplicate_pairs',
+    'build_clip_id_lookup',
+    'find_duplicates'
 ]
-
 
 def _count_segments(file_path, clip_time=10):
     try:
@@ -419,350 +406,44 @@ def process_video_directory(video_dir, processor, model, index, emb_memmap, id_m
     
     return total_clips, write_ptr
 
-
-
-def _load_embeddings_and_index(emb_file: str, index_path: str) -> Tuple[np.ndarray, faiss.Index]:
+def build_clip_id_lookup():
     """
-    Load embeddings matrix and FAISS index from files.
-    
-    Args:
-        emb_file: Path to embeddings numpy file
-        index_path: Path to FAISS index file
-    
+    Build a dictionary mapping clip_id to (filename, clip_idx) for all videos in VIDEO_DIR.
     Returns:
-        Tuple of (embeddings matrix, FAISS index)
+        dict: {clip_id: (filename, clip_idx)}
     """
-    emb_matrix = np.load(emb_file)
-    index = faiss.read_index(index_path)
-    return emb_matrix, index
-
-def _create_id_to_row_mapping(faiss_ids: np.ndarray) -> Dict[int, int]:
-    """
-    Create mapping from FAISS IDs to row indices.
-    
-    Args:
-        faiss_ids: Array of FAISS IDs
-    
-    Returns:
-        Dictionary mapping ID to row index
-    """
-    return {int(uid): i for i, uid in enumerate(faiss_ids)}
-
-def _convert_index_matrix_to_row_indices(
-    index_matrix: np.ndarray, 
-    id_to_row: Dict[int, int]
-) -> np.ndarray:
-    """
-    Convert FAISS index matrix from IDs to row indices.
-    
-    Args:
-        index_matrix: Matrix of neighbor IDs from FAISS search
-        id_to_row: Mapping from ID to row index
-    
-    Returns:
-        Matrix with IDs converted to row indices (-1 for not found)
-    """
-    num_embeddings, num_neigh = index_matrix.shape
-    id_rows = np.full_like(index_matrix, fill_value=-1, dtype=np.int64)
-    
-    for r in range(num_embeddings):
-        for c in range(num_neigh):
-            raw_id = int(index_matrix[r, c])
-            row_idx = id_to_row.get(raw_id, None)
-            if row_idx is not None:
-                id_rows[r, c] = row_idx
-            else:
-                id_rows[r, c] = -1  # ID wasn't found
-    
-    return id_rows
-
-def _find_duplicate_pairs(
-    distance_matrix: np.ndarray,
-    id_rows: np.ndarray,
-    faiss_ids: np.ndarray,
-    similarity_threshold: float = 0.3
-) -> List[Tuple[int, int]]:
-    """
-    Find duplicate pairs based on similarity threshold.
-    
-    Args:
-        distance_matrix: Matrix of distances from FAISS search
-        id_rows: Matrix of row indices for neighbors
-        faiss_ids: Array of FAISS IDs
-        similarity_threshold: Distance threshold for considering duplicates
-    
-    Returns:
-        List of duplicate pairs (id1, id2)
-    """
-    duplicates_ids = []
-    num_embeddings = distance_matrix.shape[0]
-    
-    for r in range(num_embeddings):
-        src_id = int(faiss_ids[r])
-        # Skip c=0 (self)
-        dists = distance_matrix[r, 1:]
-        neigh_rows = id_rows[r, 1:]
-        
-        # Find positions of duplicates
-        dup_positions = []
-        for idx_offset, dist in enumerate(dists):
-            if dist < similarity_threshold and neigh_rows[idx_offset] >= 0:
-                dup_positions.append(idx_offset)
-        
-        # Add duplicate pairs (avoid double-counting)
-        for pos in dup_positions:
-            neigh_row = int(neigh_rows[pos])
-            if r < neigh_row:  # avoid double-counting pairs
-                neigh_id = int(faiss_ids[neigh_row])
-                duplicates_ids.append((src_id, neigh_id))
-    
-    return duplicates_ids
-
-def find_video_duplicates(
-    emb_file: str, 
-    index_path: str, 
-    similarity_threshold: float = 0.3
-) -> List[Tuple[int, int]]:
-    """
-    Main function to find duplicate video clips.
-    
-    Args:
-        emb_file: Path to embeddings file
-        index_path: Path to FAISS index file
-        similarity_threshold: Distance threshold for duplicates
-    
-    Returns:
-        List of duplicate pairs (id1, id2)
-    """
-    # Load data
-    emb_matrix, index = _load_embeddings_and_index(emb_file, index_path)
-    
-    # Perform search
-    num_embeddings = emb_matrix.shape[0]
-    distance_matrix, index_matrix = index.search(emb_matrix, num_embeddings)
-    
-    # Get FAISS IDs and create mappings
-    faiss_ids = faiss.vector_to_array(index.id_map)
-    id_to_row = _create_id_to_row_mapping(faiss_ids)
-    
-    print(f"num_embeddings: {num_embeddings}, faiss_ids size: {faiss_ids.shape[0]}")
-    
-    # Convert index matrix to row indices
-    id_rows = _convert_index_matrix_to_row_indices(index_matrix, id_to_row)
-    
-    # Find duplicates
-    duplicates_ids = _find_duplicate_pairs(
-        distance_matrix, id_rows, faiss_ids, similarity_threshold
-    )
-    
-    return duplicates_ids
+    lookup = {}
+    for fn in sorted(os.listdir(VIDEO_DIR)):
+        if not fn.lower().endswith((".mp4", ".mov", ".avi")):
+            continue
+        match = re.search(r"_(\d+)", fn)
+        clip_num_prefix = match.group(1) if match else "0000"
+        file_path = os.path.join(VIDEO_DIR, fn)
+        try:
+            container = av.open(file_path)
+            video_stream = container.streams.video[0]
+            _, num_clips = _calculate_video_segments(video_stream, clip_time=10)
+            for idx in range(num_clips):
+                clip_id = int(f"{clip_num_prefix}{idx}")
+                lookup[clip_id] = (fn, idx)
+            container.close()
+        except Exception:
+            continue
+    return lookup
 
 
-def reconstruct_filename(clip_id):
-    """Convert clip ID to filename format"""
-    clip_id_str = str(clip_id)
-    clip_num = clip_id_str[:4].zfill(4)
-    segment_idx = clip_id_str[4:] if len(clip_id_str) > 4 else "0"
-    filename = f"TNS_{clip_num}_.mp4"
-    return filename, segment_idx
-
-def find_duplicates_at_threshold(distance_matrix, id_rows, faiss_ids, threshold):
-    """Find duplicates for a specific threshold without recomputing search"""
-    duplicates_ids = []
-    num_embeddings = len(faiss_ids)  
-    
-    for r in range(num_embeddings):
-        src_id = int(faiss_ids[r])
-        # Skip c=0 (self)
-        dists = distance_matrix[r, 1:]
-        neigh_rows = id_rows[r, 1:]
-        
-        # Find positions of duplicates
-        dup_positions = []
-        for idx_offset, dist in enumerate(dists):
-            # FIXED: Use <= instead of < to include threshold value
-            # Also exclude self-matches for non-zero thresholds
-            if threshold == 0.0:
-                # For threshold 0.0, only exact matches (but not self-matches)
-                if dist == 0.0 and neigh_rows[idx_offset] >= 0:
-                    dup_positions.append(idx_offset)
-            else:
-                # For other thresholds, include distances <= threshold but exclude self-matches
-                if dist <= threshold and dist > 0.0 and neigh_rows[idx_offset] >= 0:
-                    dup_positions.append(idx_offset)
-        
-        # Add duplicate pairs (avoid double-counting)
-        for pos in dup_positions:
-            neigh_row = int(neigh_rows[pos])
-            # Bounds check
-            if neigh_row >= len(faiss_ids):
-                print(f"Warning: neigh_row {neigh_row} exceeds bounds [0, {len(faiss_ids)-1}]")
+def find_duplicates(lim, distance_matrix, identity_matrix):
+# Find duplicate pairs 
+    pairs = []
+    for query in range(len(id_array)):
+        query_id = id_array[query]
+        start, end = lim[query], lim[query+1]
+        for i in range(start, end):
+            neighbor_id = identity_matrix[i]
+            distance = distance_matrix[i]
+            if neighbor_id == query_id: # Skip self match
                 continue
-                
-            if r < neigh_row:  # avoid double-counting pairs
-                neigh_id = int(faiss_ids[neigh_row])
-                duplicates_ids.append((src_id, neigh_id))
-    
-    return duplicates_ids
-
-def create_duplicate_mapping(duplicates_ids):
-    """Create bidirectional mapping of duplicates"""
-    duplicate_mapping = defaultdict(list)
-    duplicate_ids = set()
-    
-    for id1, id2 in duplicates_ids:
-        duplicate_mapping[id1].append(id2)
-        duplicate_mapping[id2].append(id1)
-        duplicate_ids.update([id1, id2])
-    
-    return duplicate_mapping, duplicate_ids
-
-def analyze_files_for_threshold(all_clip_ids, duplicate_mapping, duplicate_ids):
-    """Analyze each file's duplicate status"""
-    file_stats = defaultdict(lambda: {
-        'video_length_clips': 0,
-        'duplicate_names': set(),
-        'is_duplicate': False
-    })
-    
-    for clip_id in all_clip_ids:
-        filename = reconstruct_filename(clip_id)[0]
-        file_stats[filename]['video_length_clips'] += 1
-        
-        if clip_id in duplicate_ids:
-            file_stats[filename]['is_duplicate'] = True
-            # Add filenames of videos this clip is duplicated with
-            for other_id in duplicate_mapping.get(clip_id, []):
-                other_filename = reconstruct_filename(other_id)[0]
-                if other_filename != filename:  # Don't include self
-                    file_stats[filename]['duplicate_names'].add(other_filename)
-    
-    return file_stats
-
-def analyze_multiple_thresholds(distance_matrix, id_rows, faiss_ids, thresholds):
-    """
-    Analyze duplicates across multiple thresholds and create pivot-style results.
-    
-    Args:
-        distance_matrix: Matrix of distances from FAISS search
-        id_rows: Matrix of row indices for neighbors  
-        faiss_ids: Array of FAISS IDs
-        thresholds: List of threshold values to analyze
-        
-    Returns:
-        pd.DataFrame: Results with threshold columns side by side
-    """
-    all_clip_ids = set(faiss_ids)
-    
-    # Initialize results structure
-    file_results = defaultdict(lambda: {
-        'File_name': '',
-        'Video_length': 0
-    })
-    
-    # Process each threshold
-    for threshold in thresholds:
-        print(f"Processing threshold: {threshold:.4f}")  # Changed from .3f to .4f
-        
-        # Find duplicates for this threshold
-        duplicates_ids = find_duplicates_at_threshold(distance_matrix, id_rows, faiss_ids, threshold)
-        duplicate_mapping, duplicate_ids = create_duplicate_mapping(duplicates_ids)
-        file_stats = analyze_files_for_threshold(all_clip_ids, duplicate_mapping, duplicate_ids)
-        
-        # Count files that have no duplicates
-        files_with_no_duplicates = [f for f, s in file_stats.items() if not s['is_duplicate']]
-        non_duplicate_file_count = len(files_with_no_duplicates)
-        
-        # Update results for each file
-        for filename, stats in file_stats.items():
-            if file_results[filename]['File_name'] == '':
-                file_results[filename]['File_name'] = filename
-                file_results[filename]['Video_length'] = stats['video_length_clips']
-            
-            duplicate_names_str = ','.join(sorted(stats['duplicate_names'])) if stats['duplicate_names'] else 'None'
-            file_results[filename][f'Threshold_{threshold:.4f}'] = threshold  # Changed to .4f
-            file_results[filename][f'Duplicate_names_{threshold:.4f}'] = duplicate_names_str  # Changed to .4f
-            file_results[filename][f'Is_duplicate_{threshold:.4f}'] = stats['is_duplicate']  # Changed to .4f
-            file_results[filename][f'Total_non_duplicates_{threshold:.4f}'] = non_duplicate_file_count  # Changed to .4f
-    
-    # Convert to DataFrame
-    results_list = list(file_results.values())
-    df = pd.DataFrame(results_list)
-    
-    # Reorder columns to group threshold-related columns together
-    base_cols = ['File_name', 'Video_length']
-    threshold_cols = []
-    
-    for threshold in sorted(thresholds):
-        threshold_cols.extend([
-            f'Threshold_{threshold:.4f}',  # Changed to .4f
-            f'Duplicate_names_{threshold:.4f}',  # Changed to .4f
-            f'Is_duplicate_{threshold:.4f}',  # Changed to .4f
-            f'Total_non_duplicates_{threshold:.4f}'  # Changed to .4f
-        ])
-    
-    # Reorder DataFrame columns
-    df = df[base_cols + threshold_cols]
-    
-    return df
-
-def create_multi_threshold_analysis(index, emb_file, thresholds):
-    """
-    Complete pipeline for multi-threshold duplicate analysis with pivot results.
-    
-    Args:
-        index: FAISS index object
-        emb_file: Path to embeddings numpy file
-        thresholds: List of threshold values to analyze
-        
-    Returns:
-        pd.DataFrame: Results with all thresholds in adjacent columns
-    """
-    # Prepare search matrices (only once)
-    distance_matrix, id_rows, faiss_ids, all_clip_ids = prepare_search_matrices(index, emb_file)
-    
-    # Analyze all thresholds with pivot structure
-    results_df = analyze_multiple_thresholds(distance_matrix, id_rows, faiss_ids, thresholds)
-    
-    return results_df, distance_matrix
-
-
-def prepare_search_matrices(index, emb_file):
-    """
-    Prepare distance and index matrices for multi-threshold duplicate detection.
-    
-    Args:
-        index: FAISS index object
-        emb_file: Path to embeddings numpy file
-        
-    Returns:
-        tuple: (distance_matrix, id_rows, faiss_ids, all_clip_ids)
-    """
-    print("Loading embeddings and performing FAISS search...")
-    
-    # Load embeddings and perform search
-    emb_matrix = np.load(emb_file)
-    num_embeddings = emb_matrix.shape[0]
-    
-    # FIX: Don't search for ALL embeddings as neighbors - use a reasonable k value
-    k = min(100, num_embeddings)  # Search for top 100 neighbors (or less if fewer embeddings)
-    distance_matrix, index_matrix = index.search(emb_matrix, k)
-    
-    # Get FAISS IDs
-    faiss_ids = faiss.vector_to_array(index.id_map)
-    all_clip_ids = set(faiss_ids)
-    
-    # Create ID to row mapping
-    id_to_row = {int(uid): i for i, uid in enumerate(faiss_ids)}
-    
-    # Convert index matrix to row indices
-    id_rows = np.full_like(index_matrix, fill_value=-1, dtype=np.int64)
-    for r in range(num_embeddings):
-        for c in range(index_matrix.shape[1]):
-            raw_id = int(index_matrix[r, c])
-            row_idx = id_to_row.get(raw_id, None)
-            if row_idx is not None:
-                id_rows[r, c] = row_idx
-    
-    print(f"Prepared matrices for {num_embeddings} embeddings with k={k} neighbors")
-    return distance_matrix, id_rows, faiss_ids, all_clip_ids
+            # Only add if query_id < neighbor_id to avoid double pairs
+            if query_id < neighbor_id:
+                pairs.append((query_id, neighbor_id, distance))
+    return pairs
