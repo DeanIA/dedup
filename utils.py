@@ -11,26 +11,14 @@ import pandas as pd
 from collections import defaultdict
 
 __all__ = [
-    'scan_dir',
-    'create_memap',
-    'process_video_directory',
-    '_count_segments',
-    '_extract_frame_at_current_position',
-    '_create_zero_frame_fallback',
-    '_ensure_minimum_frames',
-    '_calculate_video_segments',
-    '_calculate_clip_timestamps',
-    '_seek_to_timestamp',
-    '_sample_clips_generator',
-    '_convert_clips_to_pil',
-    '_add_embeddings_to_faiss',
-    '_store_embeddings',
-    '_flush_batch',
-    'clip_id_lookup',
-    'find_duplicates'
+    "scan_dir",
+    "create_memap",
+    "process_video_directory",
+    "clip_id_lookup",
+    "find_duplicates",
 ]
 
-def _count_segments(file_path, clip_time=10):
+def _count_segments(file_path, clip_time):
     try:
         container = av.open(file_path)
         if container.duration is None:
@@ -40,13 +28,13 @@ def _count_segments(file_path, clip_time=10):
     except Exception:
         return 0
 
-def scan_dir(video_dir):
+def scan_dir(video_dir, clip_time):
     total_segments = 0
     for fn in os.listdir(video_dir):
         if not fn.lower().endswith((".mp4", ".mov", ".avi")):
             continue
         path = os.path.join(video_dir, fn)
-        total_segments += _count_segments(path, clip_time=10)
+        total_segments += _count_segments(path, clip_time=clip_time)
     return total_segments
 
 def create_memap(file_path, dtype, shape, init_value):
@@ -200,28 +188,29 @@ def _seek_to_timestamp(container, video_stream, frame_time_stamp, video_duration
 
 def _sample_clips_generator(container, video_stream, clip_time):
     num_samples = 8  # xCLIP default
-    
     if video_stream.duration is None:
         return
-    
-    # Calculate video segments
+
     video_duration, num_clips = _calculate_video_segments(video_stream, clip_time)
-    
     for clip_idx in range(num_clips):
-        # Calculate timestamps for clip
         timestamps = _calculate_clip_timestamps(clip_idx, clip_time, num_samples)
         frames_np = []
-        for frame_time_stamp in timestamps:
-            # Seek to timestamp
-            actual_timestamp = _seek_to_timestamp(container, video_stream, frame_time_stamp, video_duration)
-            # Extract frame 
-            frame_arr = _extract_frame_at_current_position(container)
-            if frame_arr is None: # Incase extraction failed 
-                zero_frame = _create_zero_frame_fallback(container, frames_np)
-                frames_np.append(zero_frame)
-            else:
-                frames_np.append(frame_arr)
+        for ts in timestamps:
+            _seek_to_timestamp(container, video_stream, ts, video_duration)
+            try:
+                frame = _extract_frame_at_current_position(container)
+            except av.AVError:
+                frame = None
+
+            if frame is None:
+                # insert a black fallback
+                frame = _create_zero_frame_fallback(container, frames_np)
+            frames_np.append(frame)
+
+        # pad/truncate to exactly num_samples
         frames_np = _ensure_minimum_frames(frames_np, num_samples)
+
+        # yield one clip per (fn, clip_idx) **always**
         yield np.stack(frames_np)
 
 
@@ -309,116 +298,85 @@ def _flush_batch(clip_buf_all, id_buf_all, processor, model, write_ptr, index, e
     return write_ptr
 
 
-def process_video_directory(video_dir, processor, model, index, emb_memmap, id_memmap, batch_size):
+def process_video_directory(video_dir, processor, model, index, emb_memmap, id_memmap, batch_size, clip_time):
     """
     Process all video files in a directory, extract clips, generate embeddings, and index them.
-    
-    This function processes videos in batches to manage memory efficiently. It extracts clips
-    from each video, generates embeddings using a pre-trained model, and stores them in 
-    memory-mapped files and a FAISS index for similarity search.
-    
-    Args:
-        video_dir (str): Path to directory containing video files (.mp4, .mov, .avi)
-        processor: Video processor for preparing clips for the model (e.g., XClip processor)
-        model: Pre-trained model for generating video embeddings (e.g., XClip model)
-        index (faiss.Index): FAISS index for storing and searching embeddings
-        emb_memmap (numpy.memmap): Memory-mapped array for storing embeddings
-        id_memmap (numpy.memmap): Memory-mapped array for storing clip IDs
-        batch_size (int, optional): Number of clips to process per batch.
-    
-    Returns:
-        tuple: (total_clips_processed, final_write_pointer)
-            - total_clips_processed (int): Total number of video clips processed
-            - final_write_pointer (int): Final position in memory-mapped arrays
-    
-    Raises:
-        FileNotFoundError: If video_dir doesn't exist
-        av.error.InvalidDataError: If video files are corrupted
-    
-    Notes:
-        - Only processes video files with extensions: .mp4, .mov, .avi
-        - Expects filenames with pattern containing "_(\d+)" for clip numbering
-        - Uses 10-second clips with 8 frames per clip (hardcoded in _sample_clips_generator)
-        - Memory usage scales with batch_size (typical: ~2.5GB for batch_size=256)
     """
+    # 1) build a global lookup and reverse‐map
+    name_dict = clip_id_lookup(video_dir, clip_time)
+    id_map = { (fn, idx): cid for cid, (fn, idx) in name_dict.items() }
+
     # Initialize batch buffers and counters
-    clip_buf_all = []    # Buffer for video clip arrays
-    id_buf_all = []      # Buffer for corresponding clip IDs
-    total_clips = 0      # Counter for total clips processed
-    write_ptr = 0        # Pointer for writing to memory-mapped arrays
-    
+    clip_buf_all = []
+    id_buf_all = []
+    total_clips = 0
+    write_ptr = 0
+
     # Process each video file in the directory (sorted for reproducibility)
     for fn in sorted(os.listdir(video_dir)):
-        # Skip non-video files
         if not fn.lower().endswith((".mp4", ".mov", ".avi")):
             continue
-
-        # Open video container and get video stream
         file_path = os.path.join(video_dir, fn)
         container = av.open(file_path)
         video_stream = container.streams.video[0]
+        idx = 0  # clip index within this file
 
-        # Extract clip number from filename (e.g., "video_1234.mp4" → "1234")
-        match = re.search(r"_(\d+)", fn)
-        clip_num_prefix = match.group(1) if match else "0000"
-        idx = 0  # Index for clips within this video
+        # Extract clips and assign the precomputed clip_id
+        for clip_np in _sample_clips_generator(container, video_stream, clip_time=clip_time):
+            clip_id = id_map.get((fn, idx))
+            if clip_id is None:
+                # skip if lookup failed
+                idx += 1
+                continue
 
-        # Generate clips from the video and process them
-        for clip_np in _sample_clips_generator(container, video_stream, clip_time=10):
-            # Create unique clip ID: concatenate file number + clip index
-            clip_id = int(f"{clip_num_prefix}{idx}")
-            
-            # Add clip and ID to batch buffers
             clip_buf_all.append(clip_np)
             id_buf_all.append(clip_id)
             total_clips += 1
             idx += 1
 
-            # Process batch when it reaches the specified size
+            # flush batch
             if len(clip_buf_all) == batch_size:
-                write_ptr = _flush_batch(clip_buf_all, 
-                                        id_buf_all, processor, 
-                                        model, write_ptr, 
-                                        index, emb_memmap, id_memmap)
-                # Clear buffers for next batch
+                write_ptr = _flush_batch(
+                    clip_buf_all, id_buf_all,
+                    processor, model, write_ptr,
+                    index, emb_memmap, id_memmap
+                )
                 clip_buf_all, id_buf_all = [], []
 
-        # Clean up video container
         container.close()
 
-    # Process any remaining clips in the final batch
+    # flush any remaining
     if clip_buf_all:
         write_ptr = _flush_batch(
             clip_buf_all, id_buf_all,
-            processor, model, write_ptr, 
-            index, emb_memmap, id_memmap)
+            processor, model, write_ptr,
+            index, emb_memmap, id_memmap
+        )
 
-    # Print processing summary
     print(f"Total segments written: {total_clips}")
     print(f"FAISS index size: {index.ntotal}")
-    
     return total_clips, write_ptr
 
-def clip_id_lookup(VIDEO_DIR):
+def clip_id_lookup(video_dir, clip_time):
     """
-    Build a dictionary mapping clip_id to (filename, clip_idx) for all videos in VIDEO_DIR.
-    Returns:
-        dict: {clip_id: (filename, clip_idx)}
+    Build a dict mapping each generated sample to a unique ID,
+    by actually iterating the same _sample_clips_generator.
     """
     lookup = {}
-    for fn in sorted(os.listdir(VIDEO_DIR)):
+    next_id = 0
+    for fn in sorted(os.listdir(video_dir)):
         if not fn.lower().endswith((".mp4", ".mov", ".avi")):
             continue
-        match = re.search(r"_(\d+)", fn)
-        clip_num_prefix = match.group(1) if match else "0000"
-        file_path = os.path.join(VIDEO_DIR, fn)
+        file_path = os.path.join(video_dir, fn)
         try:
-            container = av.open(file_path)
+            container    = av.open(file_path)
             video_stream = container.streams.video[0]
-            _, num_clips = _calculate_video_segments(video_stream, clip_time=10)
-            for idx in range(num_clips):
-                clip_id = int(f"{clip_num_prefix}{idx}")
-                lookup[clip_id] = (fn, idx)
+            # Drive the generator just to count its real outputs:
+            idx = 0
+            for _ in _sample_clips_generator(container, video_stream, clip_time):
+                lookup[(fn, idx)] = next_id
+                next_id += 1
+                idx += 1
             container.close()
         except Exception:
             continue
@@ -440,3 +398,186 @@ def find_duplicates(lim, distance_matrix, identity_matrix, id_array):
             if query_id < neighbor_id:
                 pairs.append((query_id, neighbor_id, distance))
     return pairs
+
+
+def _list_video_files(video_dir):
+    """
+    Yield (filename, full_path) for all supported videos in sorted order.
+    """
+    for fn in sorted(os.listdir(video_dir)):
+        if fn.lower().endswith((".mp4", ".mov", ".avi")):
+            yield fn, os.path.join(video_dir, fn)
+
+def _open_video_stream(file_path):
+    """
+    Open the file with PyAV and return (container, video_stream).
+    """
+    container = av.open(file_path)
+    return container, container.streams.video[0]
+
+def _process_clips_in_container(
+    fn,
+    container,
+    video_stream,
+    clip_time,
+    batch_size,
+    next_clip_id,
+    name_dict,
+    clip_buf_all,
+    id_buf_all,
+    total_clips,
+    write_ptr,
+    processor,
+    model,
+    index,
+    emb_memmap,
+    id_memmap
+):
+    """
+    Drive _sample_clips_generator, assign clip-IDs, buffer clips & IDs,
+    and flush whenever buffer hits batch_size.
+    """
+    idx = 0
+    for clip_np in _sample_clips_generator(container, video_stream, clip_time):
+        clip_id = next_clip_id
+        name_dict[clip_id] = (fn, idx)
+        next_clip_id += 1
+
+        clip_buf_all.append(clip_np)
+        id_buf_all.append(clip_id)
+        total_clips += 1
+        idx += 1
+
+        if len(clip_buf_all) == batch_size:
+            write_ptr = _flush_batch(
+                clip_buf_all,
+                id_buf_all,
+                processor,
+                model,
+                write_ptr,
+                index,
+                emb_memmap,
+                id_memmap
+            )
+            clip_buf_all.clear()
+            id_buf_all.clear()
+
+    return next_clip_id, total_clips, write_ptr
+
+# def process_video_directory(
+#     video_dir,
+#     processor,
+#     model,
+#     index,
+#     emb_memmap,
+#     id_memmap,
+#     batch_size,
+#     clip_time
+# ):
+#     """
+#     Process all videos, extract clips, generate embeddings & index them.
+#     Returns a name_dict mapping clip_id → (filename, clip_idx).
+#     """
+#     name_dict = {}
+#     next_clip_id = 0
+#     clip_buf_all, id_buf_all = [], []
+#     total_clips, write_ptr = 0, 0
+
+#     for fn, file_path in _list_video_files(video_dir):
+#         container, video_stream = _open_video_stream(file_path)
+#         next_clip_id, total_clips, write_ptr = _process_clips_in_container(
+#             fn,
+#             container,
+#             video_stream,
+#             clip_time,
+#             batch_size,
+#             next_clip_id,
+#             name_dict,
+#             clip_buf_all,
+#             id_buf_all,
+#             total_clips,
+#             write_ptr,
+#             processor,
+#             model,
+#             index,
+#             emb_memmap,
+#             id_memmap
+#         )
+#         container.close()
+
+#     # flush any leftovers
+#     if clip_buf_all:
+#         write_ptr = _flush_batch(
+#             clip_buf_all,
+#             id_buf_all,
+#             processor,
+#             model,
+#             write_ptr,
+#             index,
+#             emb_memmap,
+#             id_memmap
+#         )
+
+#     print(f"Total segments written: {total_clips}")
+#     print(f"FAISS index size: {index.ntotal}")
+
+#     return name_dict, total_clips, write_ptr
+
+def process_video_directory(
+    video_dir,
+    processor,
+    model,
+    index,
+    emb_memmap,
+    id_memmap,
+    batch_size,
+    clip_time
+):
+    """
+    Process all videos, extract clips, generate embeddings & index them.
+    Returns a name_dict mapping clip_id → (filename, clip_idx).
+    """
+    name_dict = {}
+    next_clip_id = 0
+    clip_buf_all, id_buf_all = [], []
+    total_clips, write_ptr = 0, 0
+
+    for fn, file_path in _list_video_files(video_dir):
+        container, video_stream = _open_video_stream(file_path)
+        next_clip_id, total_clips, write_ptr = _process_clips_in_container(
+            fn,
+            container,
+            video_stream,
+            clip_time,
+            batch_size,
+            next_clip_id,
+            name_dict,
+            clip_buf_all,
+            id_buf_all,
+            total_clips,
+            write_ptr,
+            processor,
+            model,
+            index,
+            emb_memmap,
+            id_memmap
+        )
+        container.close()
+
+    # flush any leftovers
+    if clip_buf_all:
+        write_ptr = _flush_batch(
+            clip_buf_all,
+            id_buf_all,
+            processor,
+            model,
+            write_ptr,
+            index,
+            emb_memmap,
+            id_memmap
+        )
+
+    print(f"Total segments written: {total_clips}")
+    print(f"FAISS index size: {index.ntotal}")
+
+    return name_dict, total_clips, write_ptr
