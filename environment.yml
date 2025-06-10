@@ -1,0 +1,19 @@
+name: dedup_env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - numpy
+  - pytorch      
+#  - cudatoolkit=11.7   # Uncomment and match your CUDA version if relevant
+  - faiss-gpu
+  - opencv     
+  - pillow         
+  - transformers
+  - pyav           
+  - pandas
+  - scipy
+  - tensorboard    
+  - pip

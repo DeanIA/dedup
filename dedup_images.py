@@ -70,7 +70,7 @@ print("Duplicate pairs found:")
 for img1, img2, score in duplicates:
     print(f"{img1} <--> {img2} (cosine similarity: {score:.4f})")
 
-# Optionally, save to CSV
+# Save to CSV
 import pandas as pd
 if duplicates:
     df = pd.DataFrame(duplicates, columns=["Image1", "Image2", "CosineSimilarity"])
