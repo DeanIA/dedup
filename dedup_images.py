@@ -6,12 +6,21 @@ import torch
 import faiss
 
 # 1. Settings
-IMAGE_DIR = "your_image_folder"  # Path to your folder with images
-MODEL_NAME = "openai/clip-vit-base-patch32"  # You can use open_clip or openai CLIP
+IMAGE_DIR = "your_image_folder" 
+MODEL_NAME = "openai/clip-vit-base-patch32"  
 SIMILARITY_THRESHOLD = 0.99  # For cosine similarity (1.0 is identical)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 2. Load model and processor
+# Device config
+if torch.cuda.is_available() : 
+    DEVICE = "cuda:1"
+    print(f"device:{DEVICE}")
+elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+    DEVICE = torch.device("mps")
+    print(f"device:{DEVICE}")
+else:
+    print(f"Plain ol' CPU")
+
+# Load model and processor
 processor = AutoProcessor.from_pretrained(MODEL_NAME)
 model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
 model.eval()
@@ -23,7 +32,7 @@ image_paths = [
     if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))
 ]
 
-# 4. Compute embeddings
+# Compute embeddings
 embeddings = []
 for path in image_paths:
     image = Image.open(path).convert("RGB")
@@ -35,27 +44,33 @@ for path in image_paths:
 
 embeddings = np.stack(embeddings).astype("float32")  # shape: (N, 512)
 
-# 5. Normalize for cosine similarity
+# Normalize for cosine similarity
 faiss.normalize_L2(embeddings)
 
-# 6. Build FAISS index
-index = faiss.IndexFlatIP(embeddings.shape[1])  # IP = inner product = cosine similarity (for normalized vectors)
+# Build FAISS index
+index = faiss.IndexFlatIP(embeddings.shape[1])  # IP cosine similarity (for normalized vectors)
 index.add(embeddings)
 
-# 7. Search for duplicates
-D, I = index.search(embeddings, k=2)  # self-match + closest neighbor
+# Search for duplicates
+lims, D, I = index.range_search(embeddings, SIMILARITY_THRESHOLD)
 
 duplicates = []
-for i, (score, neighbor_idx) in enumerate(zip(D[:,1], I[:,1])):  # Skip first (self)
-    if score > SIMILARITY_THRESHOLD and i != neighbor_idx:
-        duplicates.append((image_paths[i], image_paths[neighbor_idx], float(score)))
+N = embeddings.shape[0]
+for i in range(N):
+    # each neighbor for query i lives in I[lims[i]:lims[i+1]]
+    for pos in range(lims[i], lims[i+1]):
+        j = int(I[pos])
+        score = float(D[pos])
+        # skip self‐match and repeating pairs
+        if i < j:
+            duplicates.append((image_paths[i], image_paths[j], score))
 
-# 8. Print results
+# Print results
 print("Duplicate pairs found:")
 for img1, img2, score in duplicates:
     print(f"{img1} <--> {img2} (cosine similarity: {score:.4f})")
 
-# 9. Optionally, save to CSV
+# Optionally, save to CSV
 import pandas as pd
 if duplicates:
     df = pd.DataFrame(duplicates, columns=["Image1", "Image2", "CosineSimilarity"])

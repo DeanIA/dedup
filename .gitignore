@@ -63,3 +63,4 @@ ehthumbs.db
 *.safetensors
 
 /runs
+/old_embeddings
