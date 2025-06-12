@@ -64,3 +64,8 @@ ehthumbs.db
 
 /runs
 /old_embeddings
+/og_ds
+
+# ignore everything in ViClipXLv2
+/ViClipXLv2/*
+!/ViClipXLv2/ViCLIP_xl_v2.ipynb
